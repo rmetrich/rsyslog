@@ -443,6 +443,11 @@ strmWaitAsyncWriterDone(strm_t *pThis)
 		/* awake writer thread and make it write out everything */
 		while(pThis->iCnt > 0) {
 			pthread_cond_signal(&pThis->notEmpty);
+			/*
+			 * RHBZ 1559408 / #1701 Reproducer:
+			 * Signal asyncWriterThread() just in case it was asleep
+			 */
+			pthread_cond_signal(&pThis->writerSleep);
 			d_pthread_cond_wait(&pThis->isEmpty, &pThis->mut);
 		}
 	}
@@ -1150,6 +1155,7 @@ static rsRetVal strmConstructFinalize(strm_t *pThis)
 	/* if we work asynchronously, we need a couple of synchronization objects */
 	if(pThis->bAsyncWrite) {
 		pthread_mutex_init(&pThis->mut, 0);
+		pthread_cond_init(&pThis->writerSleep, 0);
 		pthread_cond_init(&pThis->notFull, 0);
 		pthread_cond_init(&pThis->notEmpty, 0);
 		pthread_cond_init(&pThis->isEmpty, 0);
@@ -1182,6 +1188,11 @@ stopWriter(strm_t *pThis)
 	BEGINfunc
 	pThis->bStopWriter = 1;
 	pthread_cond_signal(&pThis->notEmpty);
+	/*
+	 * RHBZ 1559408 / #1701 Reproducer:
+	 * Signal asyncWriterThread() just in case it was asleep
+	 */
+	pthread_cond_signal(&pThis->writerSleep);
 	d_pthread_mutex_unlock(&pThis->mut);
 	pthread_join(pThis->writerThreadID, NULL);
 	ENDfunc
@@ -1205,6 +1216,7 @@ CODESTARTobjDestruct(strm)
 	if(pThis->bAsyncWrite) {
 		stopWriter(pThis);
 		pthread_mutex_destroy(&pThis->mut);
+		pthread_cond_destroy(&pThis->writerSleep);
 		pthread_cond_destroy(&pThis->notFull);
 		pthread_cond_destroy(&pThis->notEmpty);
 		pthread_cond_destroy(&pThis->isEmpty);
@@ -1406,8 +1418,14 @@ doAsyncWriteInternal(strm_t *pThis, size_t lenBuf, const int bFlushZip)
 		pThis->fd, getFileDebugName(pThis),
 		pThis->iCnt, pThis->iEnq, bFlushZip);
 	/* the -1 below is important, because we need one buffer for the main thread! */
-	while(pThis->iCnt >= STREAM_ASYNC_NUMBUFS - 1)
+	while(pThis->iCnt >= STREAM_ASYNC_NUMBUFS - 1) {
+		/*
+		 * RHBZ 1559408 / #1701 Reproducer:
+		 * Signal asyncWriterThread() just in case it was asleep
+		 */
+		pthread_cond_signal(&pThis->writerSleep);
 		d_pthread_cond_wait(&pThis->notFull, &pThis->mut);
+	}
 
 	pThis->asyncBuf[pThis->iEnq % STREAM_ASYNC_NUMBUFS].lenBuf = lenBuf;
 	pThis->pIOBuf = pThis->asyncBuf[++pThis->iEnq % STREAM_ASYNC_NUMBUFS].pBuf;
@@ -1418,6 +1436,11 @@ doAsyncWriteInternal(strm_t *pThis, size_t lenBuf, const int bFlushZip)
 	if(++pThis->iCnt == 1) {
 		pthread_cond_signal(&pThis->notEmpty);
 		DBGOPRINT((obj_t*) pThis, "doAsyncWriteInternal signaled notEmpty\n");
+		/*
+		 * RHBZ 1559408 / #1701 Reproducer:
+		 * Signal asyncWriterThread() just in case it was asleep
+		 */
+		pthread_cond_signal(&pThis->writerSleep);
 	}
 	DBGOPRINT((obj_t*) pThis, "file %d(%s) doAsyncWriteInternal at exit: "
 		"iCnt %d, iEnq %d, bFlushZip %d\n",
@@ -1498,6 +1521,21 @@ asyncWriterThread(void *pPtr)
 				goto finalize_it; /* break main loop */
 			}
 			if(bTimedOut && pThis->iBufPtr > 0) {
+				/*
+				 * RHBZ 1559408 / #1701 Reproducer:
+				 * Wait for some message to be processed before
+				 * the flush done here.  This mimics what would
+				 * happen normally if a message arrived between
+				 * these two lines below:
+				 *
+				 * d_pthread_mutex_unlock(&pThis->mut);
+				 * strmFlushInternal(pThis, 1);
+				 */
+				pthread_cond_wait(&pThis->writerSleep, &pThis->mut);
+				if (pThis->iBufPtr > 0)
+					LogError(0, 0, "queue '%s', file '%s' asyncWriterThread "
+						 "DEADLOCK happens now\n",
+						 obj.GetName((obj_t*) pThis), pThis->pszFName);
 				/* if we timed out, we need to flush pending data */
 				d_pthread_mutex_unlock(&pThis->mut);
 				strmFlushInternal(pThis, 1);
@@ -2022,6 +2060,11 @@ finalize_it:
 			 */
 			pThis->bDoTimedWait = 1;
 			pthread_cond_signal(&pThis->notEmpty);
+			/*
+			 * RHBZ 1559408 / #1701 Reproducer:
+			 * Signal asyncWriterThread() just in case it was asleep
+			 */
+			pthread_cond_signal(&pThis->writerSleep);
 		}
 		d_pthread_mutex_unlock(&pThis->mut);
 	}

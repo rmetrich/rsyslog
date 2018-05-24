@@ -139,6 +139,7 @@ typedef struct strm_s {
 	sbool bVeryReliableZip; /* shall we write interim headers to create a very reliable ZIP file? */
 	int iFlushInterval; /* flush in which interval - 0, no flushing */
 	pthread_mutex_t mut;/* mutex for flush in async mode */
+	pthread_cond_t writerSleep;
 	pthread_cond_t notFull;
 	pthread_cond_t notEmpty;
 	pthread_cond_t isEmpty;
